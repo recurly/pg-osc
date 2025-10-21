@@ -195,15 +195,16 @@ module PgOnlineSchemaChange
 
         references
           .map do |row|
+            quoted_constraint_name = client.connection.quote_ident(row["constraint_name"])
             add_statement =
               if row["definition"].end_with?("NOT VALID")
-                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{row["constraint_name"]} #{row["definition"]};"
+                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{quoted_constraint_name} #{row["definition"]};"
               else
-                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{row["constraint_name"]} #{row["definition"]} NOT VALID;"
+                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{quoted_constraint_name} #{row["definition"]} NOT VALID;"
               end
 
             drop_statement =
-              "ALTER TABLE #{row["table_on"]} DROP CONSTRAINT #{row["constraint_name"]};"
+              "ALTER TABLE #{row["table_on"]} DROP CONSTRAINT #{quoted_constraint_name};"
 
             "#{drop_statement} #{add_statement}"
           end
@@ -218,11 +219,12 @@ module PgOnlineSchemaChange
 
         references
           .map do |row|
+            quoted_constraint_name = client.connection.quote_ident(row["constraint_name"])
             add_statement =
               if row["definition"].end_with?("NOT VALID")
-                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{row["constraint_name"]} #{row["definition"]};"
+                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{quoted_constraint_name} #{row["definition"]};"
               else
-                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{row["constraint_name"]} #{row["definition"]} NOT VALID;"
+                "ALTER TABLE #{row["table_on"]} ADD CONSTRAINT #{quoted_constraint_name} #{row["definition"]} NOT VALID;"
               end
             add_statement
           end
@@ -238,7 +240,8 @@ module PgOnlineSchemaChange
           constraints.select { |row| row["table_on"] == table && row["constraint_type"] == "f" }
 
         [referential_foreign_keys, self_foreign_keys].flatten.map do |row|
-          "ALTER TABLE #{row["table_on"]} VALIDATE CONSTRAINT #{row["constraint_name"]};"
+          quoted_constraint_name = client.connection.quote_ident(row["constraint_name"])
+          "ALTER TABLE #{row["table_on"]} VALIDATE CONSTRAINT #{quoted_constraint_name};"
         end
       end
 
@@ -436,6 +439,106 @@ module PgOnlineSchemaChange
       rescue StandardError => e
         logger.error("Error getting table size: #{e.message}")
         0
+      end
+
+      def get_index_mappings(client, table)
+        # Strip quotes from table name if present (e.g., "billingAttempt" -> billingAttempt)
+        table_name_unquoted = table.gsub('"', '')
+
+        query = <<~SQL
+          SELECT
+            i.relname as index_name,
+            idx.indisprimary as is_primary,
+            pg_get_indexdef(idx.indexrelid) as index_definition
+          FROM pg_index idx
+          JOIN pg_class i ON i.oid = idx.indexrelid
+          JOIN pg_class t ON t.oid = idx.indrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE t.relname = '#{table_name_unquoted}'
+            AND n.nspname = '#{client.schema}'
+          ORDER BY idx.indisprimary DESC, i.relname;
+        SQL
+
+        mappings = []
+        run(client.connection, query) { |result| mappings = result.map { |row| row } }
+        mappings
+      end
+
+      def get_constraint_mappings(client, table)
+        query = <<~SQL
+          SELECT
+            conname as constraint_name,
+            contype as constraint_type
+          FROM pg_constraint
+          WHERE conrelid = '#{client.schema}.#{table}'::regclass
+            AND contype IN ('u', 'c', 'x')
+          ORDER BY conname;
+        SQL
+
+        mappings = []
+        run(client.connection, query) { |result| mappings = result.map { |row| row } }
+        mappings
+      end
+
+      def table_exists?(client, table)
+        # Strip quotes from table name if present
+        table_name_unquoted = table.gsub('"', '')
+
+        query = <<~SQL
+          SELECT EXISTS (
+            SELECT FROM pg_tables
+            WHERE schemaname = '#{client.schema}'
+              AND tablename = '#{table_name_unquoted}'
+          );
+        SQL
+
+        exists = false
+        run(client.connection, query) { |result| exists = result[0]["exists"] == "t" }
+        exists
+      end
+
+      def rename_statements_for_indexes_and_constraints(client, original_table, new_table)
+        statements = []
+
+        # Get original index names
+        original_indexes = get_index_mappings(client, original_table)
+        new_indexes = get_index_mappings(client, new_table)
+
+        # Match indexes by position (they're in the same order)
+        original_indexes.each_with_index do |original_idx, index|
+          new_idx = new_indexes[index]
+          next unless new_idx
+
+          original_name = original_idx["index_name"]
+          new_name = new_idx["index_name"]
+
+          if original_name != new_name
+            quoted_new_name = client.connection.quote_ident(new_name)
+            quoted_original_name = client.connection.quote_ident(original_name)
+            statements << "ALTER INDEX #{quoted_new_name} RENAME TO #{quoted_original_name};"
+          end
+        end
+
+        # Get original constraint names
+        original_constraints = get_constraint_mappings(client, original_table)
+        new_constraints = get_constraint_mappings(client, new_table)
+
+        # Match constraints by position
+        original_constraints.each_with_index do |original_con, index|
+          new_con = new_constraints[index]
+          next unless new_con
+
+          original_name = original_con["constraint_name"]
+          new_name = new_con["constraint_name"]
+
+          if original_name != new_name
+            quoted_new_name = client.connection.quote_ident(new_name)
+            quoted_original_name = client.connection.quote_ident(original_name)
+            statements << "ALTER TABLE #{new_table} RENAME CONSTRAINT #{quoted_new_name} TO #{quoted_original_name};"
+          end
+        end
+
+        statements.join("\n")
       end
     end
   end

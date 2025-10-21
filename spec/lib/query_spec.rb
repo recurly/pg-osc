@@ -391,7 +391,7 @@ RSpec.describe(PgOnlineSchemaChange::Query) do
     end
 
     let(:result) do
-      "ALTER TABLE book_audits DROP CONSTRAINT book_audits_book_id_fkey; ALTER TABLE book_audits ADD CONSTRAINT book_audits_book_id_fkey FOREIGN KEY (book_id) REFERENCES books(user_id) NOT VALID;ALTER TABLE chapters DROP CONSTRAINT chapters_book_id_fkey; ALTER TABLE chapters ADD CONSTRAINT chapters_book_id_fkey FOREIGN KEY (book_id) REFERENCES books(user_id) NOT VALID;"
+      "ALTER TABLE book_audits DROP CONSTRAINT \"book_audits_book_id_fkey\"; ALTER TABLE book_audits ADD CONSTRAINT \"book_audits_book_id_fkey\" FOREIGN KEY (book_id) REFERENCES books(user_id) NOT VALID;ALTER TABLE chapters DROP CONSTRAINT \"chapters_book_id_fkey\"; ALTER TABLE chapters ADD CONSTRAINT \"chapters_book_id_fkey\" FOREIGN KEY (book_id) REFERENCES books(user_id) NOT VALID;"
     end
 
     before { setup_tables(client) }
@@ -423,7 +423,7 @@ RSpec.describe(PgOnlineSchemaChange::Query) do
     end
 
     let(:result) do
-      "ALTER TABLE books ADD CONSTRAINT books_seller_id_fkey FOREIGN KEY (seller_id) REFERENCES sellers(id) NOT VALID;"
+      "ALTER TABLE books ADD CONSTRAINT \"books_seller_id_fkey\" FOREIGN KEY (seller_id) REFERENCES sellers(id) NOT VALID;"
     end
 
     before { setup_tables(client) }
@@ -459,9 +459,9 @@ RSpec.describe(PgOnlineSchemaChange::Query) do
     it "returns drop and add statements" do
       expect(described_class.get_foreign_keys_to_validate(client, "books")).to eq(
         [
-          "ALTER TABLE book_audits VALIDATE CONSTRAINT book_audits_book_id_fkey;",
-          "ALTER TABLE chapters VALIDATE CONSTRAINT chapters_book_id_fkey;",
-          "ALTER TABLE books VALIDATE CONSTRAINT books_seller_id_fkey;",
+          "ALTER TABLE book_audits VALIDATE CONSTRAINT \"book_audits_book_id_fkey\";",
+          "ALTER TABLE chapters VALIDATE CONSTRAINT \"chapters_book_id_fkey\";",
+          "ALTER TABLE books VALIDATE CONSTRAINT \"books_seller_id_fkey\";",
         ],
       )
     end
