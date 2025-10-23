@@ -51,6 +51,10 @@ module PgOnlineSchemaChange
           Query.self_foreign_keys_to_refresh(client, client.table_name),
         )
         Store.set(:trigger_statements, Query.get_triggers_for(client, client.table_name))
+
+        # Store original index and constraint mappings for renaming after swap
+        Store.set(:original_index_mappings, Query.get_index_mappings(client, client.table_name))
+        Store.set(:original_constraint_mappings, Query.get_constraint_mappings(client, client.table_name))
       end
 
       def run!(options)
@@ -71,10 +75,12 @@ module PgOnlineSchemaChange
         copy_data! # re-uses transaction with serializable
         run_analyze!
         replay_and_swap!
+        rename_indexes_and_constraints! # Uses three-step rename to avoid conflicts
+        drop_old_table! # Drop old table after renaming (if --drop flag is set)
         run_analyze!
         validate_constraints!
         replace_views!
-        drop_and_cleanup!
+        cleanup_artifacts!
 
         logger.info("All tasks successfully completed")
       rescue StandardError => e
@@ -321,6 +327,154 @@ module PgOnlineSchemaChange
           end
       end
 
+      def rename_indexes_and_constraints!
+        logger.info("Renaming indexes and constraints to original names")
+
+        original_indexes = Store.get(:original_index_mappings) || []
+        current_indexes = Query.get_index_mappings(client, client.table_name)
+
+        original_constraints = Store.get(:original_constraint_mappings) || []
+        current_constraints = Query.get_constraint_mappings(client, client.table_name)
+
+        # Three-step rename process to avoid conflicts:
+        # Step 1: Rename old table's indexes/constraints to temporary names (if old table exists)
+        # Step 2: Rename new table's indexes/constraints from shadow names to original names
+        # Step 3: (Optional) Rename old table's indexes/constraints back if keeping old table
+
+        temp_renames = []
+        final_renames = []
+
+        # Check if old table exists
+        old_table_exists = old_primary_table && Query.table_exists?(client, old_primary_table)
+
+        if old_table_exists
+          logger.info("Old table exists, using three-step rename to avoid conflicts", table: old_primary_table)
+
+          # Step 1: Rename old table's indexes to temporary names
+          old_indexes = Query.get_index_mappings(client, old_primary_table)
+          old_indexes.each do |old_idx|
+            old_name = old_idx["index_name"]
+            temp_name = "pgosc_temp_#{SecureRandom.hex(6)}_#{old_name}"
+
+            quoted_old_name = client.connection.quote_ident(old_name)
+            quoted_temp_name = client.connection.quote_ident(temp_name)
+
+            temp_renames << "ALTER INDEX #{quoted_old_name} RENAME TO #{quoted_temp_name};"
+            logger.info("Temporarily renaming old table index", from: old_name, to: temp_name)
+          end
+
+          # Step 1b: Rename old table's constraints to temporary names
+          old_constraints = Query.get_constraint_mappings(client, old_primary_table)
+          old_constraints.each do |old_con|
+            old_name = old_con["constraint_name"]
+            temp_name = "pgosc_temp_#{SecureRandom.hex(6)}_#{old_name}"
+
+            quoted_old_name = client.connection.quote_ident(old_name)
+            quoted_temp_name = client.connection.quote_ident(temp_name)
+
+            temp_renames << "ALTER TABLE #{old_primary_table} RENAME CONSTRAINT #{quoted_old_name} TO #{quoted_temp_name};"
+            logger.info("Temporarily renaming old table constraint", from: old_name, to: temp_name)
+          end
+
+          # Execute temporary renames first
+          unless temp_renames.empty?
+            Query.run(client.connection, temp_renames.join("\n"))
+            logger.info("Renamed #{temp_renames.size} old table indexes/constraints to temporary names")
+          end
+        end
+
+        # Step 2: Rename new table's indexes from shadow names to original names
+        # Match indexes by their definition (columns they're built on) instead of position
+        current_indexes.each do |current_idx|
+          current_name = current_idx["index_name"]
+          # After swap, the table is now client.table_name, so normalize using that
+          current_def = normalize_index_definition(current_idx["index_definition"], client.table_name)
+
+          logger.info("Checking current index for match",
+            name: current_name,
+            definition: current_idx["index_definition"],
+            normalized: current_def)
+
+          # Find matching original index by comparing definitions
+          original_idx = original_indexes.find do |orig|
+            normalized_orig_def = normalize_index_definition(orig["index_definition"], client.table_name)
+
+            logger.info("Comparing with original index",
+              original_name: orig["index_name"],
+              original_definition: orig["index_definition"],
+              normalized_original: normalized_orig_def,
+              normalized_current: current_def,
+              match: normalized_orig_def == current_def)
+
+            normalized_orig_def == current_def
+          end
+
+          if original_idx.nil?
+            logger.info("No matching original index found", current_name: current_name)
+            next
+          end
+
+          original_name = original_idx["index_name"]
+
+          # Only rename if:
+          # 1. Names are different
+          # 2. Current name looks like a shadow table name (starts with pgosc_st_)
+          # 3. Original name doesn't look like a shadow table name
+          if original_name != current_name &&
+             current_name.start_with?("pgosc_st_") &&
+             !original_name.start_with?("pgosc_st_")
+            quoted_current_name = client.connection.quote_ident(current_name)
+            quoted_original_name = client.connection.quote_ident(original_name)
+            final_renames << "ALTER INDEX #{quoted_current_name} RENAME TO #{quoted_original_name};"
+            logger.info("Renaming index", from: current_name, to: original_name)
+          else
+            logger.info("Skipping rename",
+              current_name: current_name,
+              original_name: original_name,
+              names_different: original_name != current_name,
+              current_is_shadow: current_name.start_with?("pgosc_st_"),
+              original_not_shadow: !original_name.start_with?("pgosc_st_"))
+          end
+        end
+
+        # Step 2b: Rename constraints back to original names (keep position-based matching for constraints)
+        original_constraints.each_with_index do |original_con, index|
+          current_con = current_constraints[index]
+          next unless current_con
+
+          original_name = original_con["constraint_name"]
+          current_name = current_con["constraint_name"]
+
+          # Only rename if:
+          # 1. Names are different
+          # 2. Current name looks like a shadow table name (starts with pgosc_st_)
+          # 3. Original name doesn't look like a shadow table name
+          if original_name != current_name &&
+             current_name.start_with?("pgosc_st_") &&
+             !original_name.start_with?("pgosc_st_")
+            quoted_current_name = client.connection.quote_ident(current_name)
+            quoted_original_name = client.connection.quote_ident(original_name)
+            final_renames << "ALTER TABLE #{client.table_name} RENAME CONSTRAINT #{quoted_current_name} TO #{quoted_original_name};"
+            logger.info("Renaming constraint", from: current_name, to: original_name)
+          end
+        end
+
+        return if final_renames.empty?
+
+        Query.run(client.connection, final_renames.join("\n"))
+        logger.info("Renamed #{final_renames.size} indexes and constraints to original names")
+      end
+
+      def normalize_index_definition(index_def, table_name)
+        return "" unless index_def
+
+        # Remove everything before USING to compare only the index structure
+        # e.g., "CREATE INDEX idx ON table USING btree (col)" -> "btree (col)"
+        # This removes: CREATE [UNIQUE] INDEX index_name ON schema.table_name
+        normalized = index_def.gsub(/CREATE (?:UNIQUE )?INDEX .*? ON .*? USING /, "")
+        normalized
+      end
+
       def replace_views!
         view_definitions = Query.view_definitions_for(client, old_primary_table)
         view_definitions.each do |definition|
@@ -336,8 +490,18 @@ module PgOnlineSchemaChange
         end
       end
 
-      def drop_and_cleanup!
-        primary_drop = client.drop ? "DROP TABLE IF EXISTS #{old_primary_table};" : ""
+      def drop_old_table!
+        # Drop old primary table first to free up index names
+        # This must happen BEFORE rename_indexes_and_constraints! to avoid name conflicts
+        if client.drop && old_primary_table
+          logger.info("Dropping old primary table", table: old_primary_table)
+          sql = "DROP TABLE IF EXISTS #{old_primary_table};"
+          Query.run(client.connection, sql)
+        end
+      end
+
+      def cleanup_artifacts!
+        # Clean up audit table, shadow table (if exists), and reset settings
         audit_table_drop = audit_table ? "DROP TABLE IF EXISTS #{audit_table}" : ""
         shadow_table_drop = shadow_table ? "DROP TABLE IF EXISTS #{shadow_table}" : ""
 
@@ -345,13 +509,18 @@ module PgOnlineSchemaChange
           DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON #{client.table_name};
           #{audit_table_drop};
           #{shadow_table_drop};
-          #{primary_drop}
           RESET statement_timeout;
           RESET client_min_messages;
           RESET lock_timeout;
         SQL
 
         Query.run(client.connection, sql)
+      end
+
+      def drop_and_cleanup!
+        # Legacy method for backward compatibility
+        drop_old_table!
+        cleanup_artifacts!
       end
 
       private

@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+docs/
+README*
+
+# Development
+.rvm
+.bundle
+vendor/bundle
+*.gem
+.env
+
+# Tests
+spec/
+test/
+coverage/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI/CD
+.circleci/
+.travis.yml
+.github/
+
+# Docker
+Dockerfile
+docker-compose.yml
