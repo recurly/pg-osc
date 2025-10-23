@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  pg-osc:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      - PGPASSWORD=${PGPASSWORD}
+    network_mode: host
+    # Example usage - override the command:
+    # docker-compose -f docker-compose.dev.yml run --rm pg-osc perform \
+    #   --alter-statement 'ALTER TABLE books ADD COLUMN purchased BOOLEAN DEFAULT FALSE' \
+    #   --dbname "postgres" \
+    #   --host "localhost" \
+    #   --username "postgres"
+
+  # Optional: PostgreSQL for testing
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
